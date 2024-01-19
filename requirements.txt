@@ -1,5 +1,6 @@
-altair
-numpy
-pandas
-pydeck
 streamlit
+pandas
+numpy
+pymongo
+breeze_connect
+streamlit-aggrid

@@ -1,0 +1,721 @@
+# -*- coding: utf-8 -*-
+
+import streamlit as st, pandas as pd, numpy as np
+import pymongo
+from breeze_connect import BreezeConnect
+from bson.objectid import ObjectId
+from datetime import datetime
+from st_aggrid import AgGrid
+from st_aggrid import grid_options_builder as gob
+from time import sleep
+
+st.set_page_config(layout="wide")
+
+
+def rebalance(cq, mlq):
+    x = ( cq // mlq ) + ( 1 if cq % mlq > 0 else 0)
+    return [x, mlq, cq % mlq]
+
+@st.cache_resource
+def resourceconnections():
+
+    mdbcon = "mongodb+srv://pjsaravanan:Saran%402810@mdbcluster.dhqbs.mongodb.net/mytrading?retryWrites=true&w=majority"
+    client = pymongo.MongoClient(mdbcon)
+
+    app_key = "30G=e80786~232r727OtI4387xM#0194"
+    secret_key = "5Z45672$75D_6632*654231560443Ef3"
+
+
+    ctrdb = client.mytrading    
+
+    temptoken = ctrdb.apitoken.find_one({'_id' : ObjectId('63714ac05274e29cd3527086')}) 
+    mytoken = temptoken["stoken"]
+
+    cbreeze = BreezeConnect(app_key)
+    cbreeze.generate_session(api_secret=secret_key, session_token=mytoken)
+    
+    return ctrdb, cbreeze
+
+trdb, breeze = resourceconnections()
+sleeptime = 0.1
+
+
+   
+def chkdiff(action, pricediff):
+    print("checking price diff")
+    print(f"{action}---{pricediff}")
+    if action == "Buy" and pricediff < 0 :
+        return True
+    elif action == "Sell" and pricediff> 0 :
+        return True
+    else :
+        st.write("Invalid Value")
+        return 
+
+
+if "counter" not in st.session_state:
+    st.session_state.counter = 0
+    if "mapper" not in st.session_state:
+        st.session_state.mapper = {
+            "symboltype":"INDEX", 
+            "selectedsymbol":"NIFTY", 
+            "selectedinstrumenttype":"FUTURE",
+            "exchange_code":"NFO", 
+            "product_type":"futures", 
+            "ordertype":"limit", 
+            "triggerprice":0, 
+            "qty":0, 
+            "limitprice":0, 
+            "m_expirydate":datetime.now().strftime("%d-%b-%Y"), 
+            "m_rightchoice":"XX", 
+            "m_strike":0, 
+            "orderid":"", 
+            "rights":"others", 
+            "targetaction":"sell", 
+            "targetordertype":"limit", 
+            "targetprice":0, 
+            "targetqty":0, 
+            "tradinginstrument":"",
+            "maxqty" : 1800,
+            "lotsize" : 50,
+            "daystoexpire" : 0,
+            "stktoken" : "",
+            "targetorderready" :"" ,
+            "amaxqty" : 0,
+            "pricediff" : 0.00,
+            "sliceqty" : 0,
+            "martingale" : False,
+            "slicefactor" : 0.0
+            
+          }
+
+    if "watchorder" not in st.session_state:
+        st.session_state.watchorder=[{"watchorderid" : 0, "sq_mapper" : st.session_state.mapper }]
+    
+    
+def ordernow(updatefavourties):
+    if updatefavourties:
+        y = ""
+        # tmapper introduced to get rid _id issue
+        tmapper = st.session_state.mapper
+        if "_id" in tmapper.keys():
+            del tmapper["_id"]
+        for k, v in tmapper.items():
+            if isinstance(v, np.int64): 
+                tmapper[k] = int(v)
+        try:
+            
+
+            y = trdb.favourites.insert_one(tmapper)
+
+        except Exception as e:
+            st.error(f"Exception Message - {e}\n - Not Saved to Favourites... Probably duplicate error occured")
+        finally:
+            print(y)
+    if st.session_state.amc == amcoptions[0]:
+        print(f"inside order now mapper value is - {st.session_state.mapper}")
+        try:
+            orderresponse  = breeze.place_order(stock_code=st.session_state.mapper["selectedsymbol"],
+                                                exchange_code=st.session_state.mapper["exchange_code"],
+                                                product=st.session_state.mapper["product_type"].lower(),
+                                                action=st.session_state.mapper["action"].lower(),
+                                                order_type=st.session_state.mapper["ordertype"].lower(),
+                                                stoploss=str(st.session_state.mapper["triggerprice"]),
+                                                quantity=str(st.session_state.mapper["qty"]),
+                                                price=str(st.session_state.mapper["limitprice"]),
+                                                validity="day",
+                                                disclosed_quantity="0",
+                                                expiry_date=st.session_state.mapper["m_expirydate"],
+                                                right=st.session_state.mapper["rights"],
+                                                strike_price=st.session_state.mapper["m_strike"])
+        except Exception as e:
+            st.error(f"Exception Message - {e}\n{orderresponse}... Place order again")
+            
+        print(f"order response - {orderresponse}\n")            
+        print(f"insde order now - order placed details - {orderresponse}")
+
+        if orderresponse["Success"] != None:
+            st.session_state.mapper["orderid"] = orderresponse["Success"]["order_id"]
+            if st.session_state.amcplacetype==validordertypes[3]:
+                st.session_state.watchorder.append({"watchorderid" : st.session_state.mapper["orderid"],
+                                                    "sq_mapper" :  st.session_state.mapper})
+                trdb.watchorder.insert_one({"watchorderid" : st.session_state.mapper["orderid"],
+                                                    "sq_mapper" :  st.session_state.mapper})
+        else:
+            st.error(f"{orderresponse['Error']} - Please try submitting order again" )
+
+def favorder(frombutton):
+  if frombutton == "favorder":
+    st.session_state.mapper = st.session_state.allfav.iloc[
+      st.session_state.optionslist.index(
+        st.session_state.selectedoption)].to_dict()
+  else:
+    pass
+  ordernow(False)
+
+
+def orderaveraging():
+    place_qty = st.session_state.mapper["qty"]
+    target_qty = st.session_state.mapper["amaxqty"]
+    start_price = st.session_state.mapper["limitprice"]
+    varying_price = st.session_state.mapper["pricediff"]
+    increment_qty = st.session_state.mapper["sliceqty"]
+    martingale = st.session_state.mapper["martingale"]
+    martingalefactor = st.session_state.mapper["slicefactor"]
+    print(f"{increment_qty} - {target_qty}         ")
+    if (increment_qty < target_qty):
+        order_price = start_price 
+        total_placed = 0
+        while True:
+            total_placed = total_placed + place_qty
+            print(f"place order for {place_qty} / {total_placed} / {target_qty} @ {order_price}")
+            st.session_state.mapper["qty"] = place_qty
+            st.session_state.mapper["limitprice"] = order_price
+            if st.session_state.mapper["ordertype"] == "Stoploss" :
+                st.session_state.mapper["triggerprice"]= order_price - 1 if st.session_state.mapper["action"] == "Buy" else order_price + 1 
+            
+            if st.session_state.mapper["qty"] <= st.session_state.mapper["maxqty"]:
+                ordernow(False)
+            else:
+                st.info("Order Place Qty is more than the Max Qty per transaction...Placing Orders for Max Qty")
+                st.session_state.mapper["qty"] = st.session_state.mapper["maxqty"]
+            increment_qty = increment_qty if not martingale else int(total_placed * martingalefactor // st.session_state.mapper["lotsize"])*st.session_state.mapper["lotsize"]
+            order_price = order_price if order_price + varying_price <= 0 else order_price + varying_price
+            if (total_placed + increment_qty) > target_qty:
+                place_qty = target_qty - total_placed
+                if place_qty <= 0:
+                    break
+            if (total_placed + increment_qty) <= target_qty:
+                place_qty = increment_qty
+            sleep(sleeptime)
+                
+            
+    else:
+        print("error in increment qty")
+        
+        
+
+if st.button("Refresh", type="primary"):
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    st.session_state.clear()
+    st.rerun()
+
+if st.session_state.counter == 0:
+
+    if "all_symbol" not in st.session_state:
+        st.session_state.all_symbol="" # pd.DataFrame(list(trdb.symbolmapping.find({})))
+    
+    if "all_instrument" not in st.session_state:
+        st.session_state.all_instrument = "" # pd.DataFrame(list(trdb.fnobasicdata.find({})))
+    
+    if "existingpositions" not in st.session_state:
+        st.session_state.existingpositions=pd.DataFrame({})
+    
+    if "placedorders" not in st.session_state:
+        st.session_state.placedorders=pd.DataFrame({})
+    
+    if "instruments" not in st.session_state:
+        st.session_state.instruments= pd.DataFrame({})
+
+    if "allsymbol" not in st.session_state:
+        st.session_state.allsymbol=st.session_state.all_symbol
+    
+    if "symbol" not in st.session_state:
+        st.session_state.symbol=[]
+        
+    if "allexpirydate" not in st.session_state:
+        st.session_state.allexpirydate=[] 
+
+    if "m_instrument" not in st.session_state:
+        st.session_state.m_instrument = st.session_state.all_instrument
+    
+    if "m_allexpirydate" not in st.session_state:
+        st.session_state.m_allexpirydate=[] 
+    
+    if "m_allstrike" not in st.session_state:
+        st.session_state.m_allstrike=[] 
+    
+    if "tradinginstrument" not in st.session_state:
+        st.session_state.tradinginstrument=""
+        
+    if "allsymbolsortedlist" not in st.session_state:
+        st.session_state.allsymbolsortedlist=""
+
+    if "allfav" not in st.session_state:
+        st.session_state.allfav = ""
+
+    if "optionslist" not in st.session_state:
+        st.session_state.optionslist = []
+        
+    if "selectedoption" not in st.session_state:
+        st.session_state.selectedoption = ""
+
+    if "vot_index" not in st.session_state:
+        st.session_state.vot_index= None
+
+
+    st.session_state.counter = 1
+    
+
+
+  
+insc1 = st.container()
+
+with insc1:
+
+        
+    r1 = st.container()
+    with r1:
+        c1, c2, c3, c4, c5, c6 = st.columns(spec=[4, 5, 5, 7, 3, 4], gap="small")
+            
+        with c1:
+            basetype =["INDEX","STOCK"]
+            st.session_state.mapper["symboltype"] = st.selectbox("Base Type",options=basetype, key="basetype" )
+            
+        st.session_state.allsymbol = pd.DataFrame(list(trdb.symbolmapping.find({"IndexOrStock" : st.session_state.mapper["symboltype"]},{"_id" :0})))        
+        st.session_state.allsymbolsortedlist=list(st.session_state.allsymbol["stock_code"])
+        st.session_state.allsymbolsortedlist.sort()
+        
+        with c2:
+            st.session_state.mapper["selectedsymbol"] = st.selectbox("Symbol",options= st.session_state.allsymbolsortedlist, key="selectedsymbol")
+            st.session_state.allsymbol = st.session_state.allsymbol[(st.session_state.allsymbol["stock_code"]==st.session_state.mapper["selectedsymbol"])]
+            st.session_state.mapper["maxqty"] = st.session_state.allsymbol.iloc[0]["maxqty"]
+            
+        with c3:
+            instrumenttype = ["FUTURE", "OPTION"]
+            st.session_state.mapper["selectedinstrumenttype"] = st.selectbox("InstrumentType",options=instrumenttype, index=1, key="selectinstrumenttype")
+
+        instrumentname = "FUT" if st.session_state.mapper["selectedinstrumenttype"]==instrumenttype[0] else "OPT" 
+        st.session_state.mapper["instrumentname"] = instrumentname + ( "IDX" if st.session_state.mapper["symboltype"]== basetype[0] else "STK" )
+        st.session_state.m_instrument = pd.DataFrame( list( trdb.fnobasicdata.find( {"Series" : st.session_state.mapper["selectedinstrumenttype"], 
+                                                                                     "ShortName" : st.session_state.mapper["selectedsymbol"], 
+                                                                                     "InstrumentName" : st.session_state.mapper["instrumentname"]}, {"_id" : 0} )))
+                                                                                                                     
+        
+        st.session_state.m_instrument["StrikePrice"]=st.session_state.m_instrument["StrikePrice"].astype(int)
+        st.session_state.m_allexpirydate = list(set(list(st.session_state.m_instrument["ExpiryDate"])))
+        st.session_state.m_allexpirydate.sort()
+        st.session_state.m_allexpirydate = [date.strftime("%d-%b-%Y") for date in st.session_state.m_allexpirydate]        
+
+        with c4:
+            st.session_state.mapper["m_expirydate"] = st.selectbox("Expiry Date", options=st.session_state.m_allexpirydate)
+
+        with c5:
+            if instrumentname[0:3] == "OPT" :
+                rights = ["CE", "PE"]
+                st.session_state.mapper["m_rightchoice"] = st.selectbox("Rights", options=rights) 
+            else:
+                st.session_state.mapper["m_rightchoice"] = "XX"
+                st.text("Rights" )
+                st.text("XX" )
+
+        if st.session_state.mapper["m_rightchoice"] == "XX":
+                st.session_state.mapper["rights"]= "others"
+        elif st.session_state.mapper["m_rightchoice"] == "CE":
+                st.session_state.mapper["rights"]= "call"
+        elif st.session_state.mapper["m_rightchoice"] == "PE":
+                st.session_state.mapper["rights"]= "put"
+
+        st.session_state.m_instrument = pd.DataFrame( list( trdb.fnobasicdata.find( {"Series" : st.session_state.mapper["selectedinstrumenttype"], 
+                                                                                     "ShortName" : st.session_state.mapper["selectedsymbol"], 
+                                                                                     "InstrumentName" : st.session_state.mapper["instrumentname"],
+                                                                                     "ExpiryDate" : datetime.strptime(st.session_state.mapper["m_expirydate"], "%d-%b-%Y" ),
+                                                                                     "OptionType" : st.session_state.mapper["m_rightchoice"] }, {"_id" : 0} )))
+
+        st.session_state.m_instrument["StrikePrice"] = st.session_state.m_instrument["StrikePrice"].astype(int)
+        st.session_state.m_allstrike = list(st.session_state.m_instrument["StrikePrice"])
+        st.session_state.m_allstrike.sort()
+        
+        with c6:
+            if instrumentname[0:3] == "OPT" :
+
+                st.session_state.mapper["m_strike"]= st.selectbox("Strike Price", options=st.session_state.m_allstrike)
+                st.session_state.mapper["m_strike"] = str(int(st.session_state.mapper["m_strike"]))
+
+            else:
+                st.session_state.mapper["m_strike"] = 0
+
+        st.session_state.m_instrument = pd.DataFrame( list( trdb.fnobasicdata.find( {"Series" : st.session_state.mapper["selectedinstrumenttype"], 
+                                                                                     "ShortName" : st.session_state.mapper["selectedsymbol"], 
+                                                                                     "InstrumentName" : st.session_state.mapper["instrumentname"],
+                                                                                     "ExpiryDate" : datetime.strptime(st.session_state.mapper["m_expirydate"], "%d-%b-%Y" ),
+                                                                                     "OptionType" : st.session_state.mapper["m_rightchoice"],
+                                                                                     "StrikePrice" : int(st.session_state.mapper["m_strike"])}, {"_id" : 0} )))
+        
+        print(f"m_instruments shapes after filtering {st.session_state.m_instrument.shape}"  )    
+        st.session_state.mapper["lotsize"] = st.session_state.m_instrument.iloc[0]["LotSize"]
+        st.session_state.mapper["stktoken"] = "4.1!"+str(st.session_state.m_instrument.iloc[0]["Token"])
+        st.session_state.mapper["daystoexpire"] = (datetime.strptime(st.session_state.mapper["m_expirydate"], "%d-%b-%Y") - datetime.now()).days
+        
+
+        rr1 = st.container()
+        with rr1:
+            c1, c2, c3, c4, c5, c6 = st.columns(spec=6, gap="small")
+            st.session_state.mapper["exchange_code"] = "NFO"         
+            st.session_state.mapper["product_type"] = "futures" if instrumentname[0:3]=="FUT" else "options"
+            try:
+                st.session_state.mapper["curprice"] = breeze.get_quotes(stock_code=st.session_state.mapper["selectedsymbol"],
+                        exchange_code=st.session_state.mapper["exchange_code"],
+                        expiry_date=st.session_state.mapper["m_expirydate"],
+                        product_type=st.session_state.mapper["product_type"],
+                        right=st.session_state.mapper["rights"],
+                        strike_price=st.session_state.mapper["m_strike"])["Success"][0]["ltp"]
+            except Exception as e:
+                st.error(f"Exception Message {e} ")
+                st.session_state.mapper["curprice"] = 0
+            with c1:
+                st.write(f"LTP      : :orange[{st.session_state.mapper['curprice']}] ")
+            with c2:
+                st.write(f"Lot Size : :orange[{st.session_state.mapper['lotsize']}]")
+            with c3:
+                st.write(f"Max Qty  : :orange[{st.session_state.mapper['maxqty']}]")
+            with c4:
+              st.write(f"Max Lots : :orange[{int(st.session_state.mapper['maxqty'] / st.session_state.mapper['lotsize'])}]")
+                
+            with c5:
+                st.write(f"Expires in : :orange[{st.session_state.mapper['daystoexpire']}] d")
+            
+    amcc1, amcc2, amcc4, amcc5, amcc6, amcc7 = st.columns([4,6,5,4,6,5])
+    if "amc" not in st.session_state:
+        st.session_state.amc = 1
+        
+    if "amcplacetype " not in st.session_state:
+        st.session_state.amcplacetype = 1
+    
+    with amcc1:
+        amcoptions = ["Place", "Modify", "Cancel"]
+        st.session_state.amc = st.radio("Orders", options=amcoptions, horizontal=False)
+        if st.session_state.amc == amcoptions[0]:        
+            validactions = ["Buy", "Sell"]
+            st.session_state.action = st.radio("Action", options=validactions)  
+            pl = ":white " + (":green-background" if st.session_state.action == "Buy" else ":red-background" ) 
+            st.session_state.mapper["action"] = st.session_state.action
+            st.session_state.mapper["targetaction"] = "sell" if st.session_state.action==validactions[0] else "buy"
+
+    with amcc2:
+        if st.session_state.amc == amcoptions[0]:
+            validordertypes = ["Market", "Limit", "StopLoss", "INVADE", "Normal Averaging", "Martingale Averaging"]
+            st.session_state.amcplacetype = st.radio(label=pl+"[Order Type]",options=validordertypes, horizontal=False)
+            st.session_state.vot_index = validordertypes.index(st.session_state.amcplacetype)
+            st.session_state.mapper["ordertype"] = "limit" if st.session_state.vot_index >=3 else st.session_state.amcplacetype
+            st.session_state.mapper["targetordertype"] = "limit"
+            st.session_state.mapper["triggerprice"]=""
+
+    with amcc4:
+        if st.session_state.amc == amcoptions[0]:
+            if st.session_state.amcplacetype == validordertypes[0]:
+                st.session_state.mapper["limitprice"] = 0
+            else:
+#            if amcplacetype == validordertypes[1] or amcplacetype == validordertypes[2] :
+                st.session_state.mapper["limitprice"] = st.number_input(label=pl+"[Limit Price]")
+        
+            if st.session_state.amcplacetype == validordertypes[2] :
+                st.session_state.mapper["triggerprice"] = st.number_input(label=pl+"[Trigger Price]")
+                
+            if st.session_state.amcplacetype == validordertypes[3] :
+                st.session_state.mapper["targetprice"] = st.number_input(label=pl+"[Target Price]")
+            
+
+    with amcc5:
+        
+        if st.session_state.amc == amcoptions[0]  :
+#            if st.session_state.vot_index < 4:
+
+            st.session_state.mapper["qty"]= st.number_input(label=pl+"[Lots]", min_value=1, max_value=int(st.session_state.mapper["maxqty"]/st.session_state.mapper["lotsize"]))*st.session_state.mapper["lotsize"] 
+
+            if st.session_state.amcplacetype == validordertypes[3] :
+                st.session_state.mapper["targetqty"] = st.number_input(label=pl+"[Target Lots]",min_value=1, max_value=int(st.session_state.mapper["qty"]/st.session_state.mapper["lotsize"]))*st.session_state.mapper["lotsize"]
+
+            if st.session_state.amcplacetype == validordertypes[4] :
+                st.session_state.mapper["amaxqty"] = st.number_input(label=pl+"[Avg. Max Lots]",min_value=1)*st.session_state.mapper["lotsize"]
+                st.session_state.mapper["sliceqty"] = st.number_input(label=pl+"[Slice Lots]", min_value=1)*st.session_state.mapper["lotsize"]
+                mn= -999999999.0 if st.session_state.action == "Buy" else 0.0001
+                mx = -0.0001 if st.session_state.action == "Buy" else 999999999.0
+                st.session_state.mapper["pricediff"] = st.number_input(label=pl+"[Price Diff]", key="avg" ) #, min_value=mn, max_value=mx)
+                if st.session_state.action == "Buy" :
+                    if st.session_state.mapper["pricediff"] < 0 :
+                        st.session_state.mapper["ordertype"] = "Limit" 
+                    else:
+                        st.session_state.mapper["ordertype"] = "Stoploss" 
+                if st.session_state.action == "Sell" :
+                    if st.session_state.mapper["pricediff"] < 0 :
+                        st.session_state.mapper["ordertype"] = "Stoploss" 
+                    else:
+                        st.session_state.mapper["ordertype"] = "Limit" 
+                
+
+            if st.session_state.amcplacetype == validordertypes[5] :
+                st.session_state.mapper["amaxqty"] = st.number_input(label=pl+"[MAvg Max Lots]", min_value=1)*st.session_state.mapper["lotsize"]
+                st.session_state.mapper["slicefactor"] = st.number_input(label=pl+"[Slice Factor]")
+                mn= -999999999.0 if st.session_state.action == "Buy" else 0.01
+                mx = -0.01 if st.session_state.action == "Buy" else 999999999.0
+                st.session_state.mapper["pricediff"] = st.number_input(label=pl+"[Price Diff]", key="mavg" ) #, min_value=mn, max_value=mx)
+                st.session_state.mapper["martingale"] = True
+                if st.session_state.action == "Buy" :
+                    if st.session_state.mapper["pricediff"] < 0 :
+                        st.session_state.mapper["ordertype"] = "Limit" 
+                    else:
+                        st.session_state.mapper["ordertype"] = "Stoploss" 
+                if st.session_state.action == "Sell" :
+                    if st.session_state.mapper["pricediff"] < 0 :
+                        st.session_state.mapper["ordertype"] = "Stoploss" 
+                    else:
+                        st.session_state.mapper["ordertype"] = "Limit" 
+
+    with amcc6:
+        st.write(f"Qty : ")
+        st.write(f":orange[{st.session_state.mapper['qty']}]")  
+        if st.session_state.vot_index == 3:
+      
+            if st.session_state.mapper["targetqty"] < st.session_state.mapper["qty"] :
+                st.session_state.mapper["targetqty"] = (st.session_state.mapper["qty"] - st.session_state.mapper["targetqty"] )
+                st.write(f"INVADE Qty : ")
+                st.write(f":orange[{st.session_state.mapper['targetqty']} @ {st.session_state.mapper['qty'] * st.session_state.mapper['limitprice'] / st.session_state.mapper['targetqty'] :.2f}]")
+            else:
+                st.write(f"Quick Scalping : ")
+                st.write(f":orange[{st.session_state.mapper['targetprice'] - st.session_state.mapper['limitprice'] :0.2f} @ {st.session_state.mapper['qty']}]")
+        if st.session_state.vot_index >= 4 and st.session_state.vot_index <= 5:
+            st.write(f":orange[{int(st.session_state.mapper['amaxqty'])}]")        
+
+    with amcc7:
+        st.write(f"Trade Amt :   ")
+        if st.session_state.vot_index >= 4 and st.session_state.vot_index <= 5:
+            st.write(f"~:orange[{st.session_state.mapper['limitprice'] * st.session_state.mapper['amaxqty'] :0.2f}]   ")
+        else:
+            st.write(f":orange[{st.session_state.mapper['limitprice'] * st.session_state.mapper['qty'] :0.2f}]   ")
+        
+        st.write(pl+"[" +st.session_state.mapper["selectedinstrumenttype"] + "]")
+        st.write(pl+"[" +st.session_state.mapper["selectedsymbol"] + " " + str(st.session_state.mapper["m_strike"] ) 
+                 +  " " + str(st.session_state.mapper["m_expirydate"]) 
+                 + " " + st.session_state.mapper["m_rightchoice"] + "]")
+        
+        
+        if ( st.button("Place Order", type="primary")):
+            if st.session_state.vot_index <= 3 :
+                ordernow(True)
+            else:
+                orderaveraging()
+                st.session_state.mapper["martingale"] = False
+                
+    if st.session_state.amc == "Modify":
+        pass
+
+    if st.session_state.amc == "Cancel":
+        pass
+    
+    def showoption():
+        st.write(f"selected option - {st.session_state.selectedoption}")
+        st.write(f"selected mapper - {st.session_state.mapper}")
+        
+       
+#builds a gridOptions dictionary using a GridOptionsBuilder instance.
+def buildgridoptions(df):
+    builder = gob.GridOptionsBuilder.from_dataframe(df)
+    builder.configure_column(
+        field="stock_code",
+        rowGroup=True,
+        )
+    builder.configure_selection( selection_mode="multiple", use_checkbox=True)
+#    builder.configure_selection( fcols, filter = True)
+    builder.configure_columns(["sq_qty","sq_price","sq_stoploss"],editable=True)
+    builder.configure_pagination(paginationPageSize=1000)
+    builder.configure_side_bar()
+    go = builder.build()
+    return go
+
+def buildgridorderoptions(dforder):
+    obuilder = gob.GridOptionsBuilder.from_dataframe(dforder)
+    obuilder.configure_selection( selection_mode="multiple", use_checkbox=True)
+    obuilder.configure_pagination(paginationPageSize=1000)
+    obuilder.configure_column(
+        field="stock_code",
+        rowGroup=True,
+        )
+    obuilder.configure_columns(["quantity","price","stoploss"],editable=True)
+    obuilder.configure_side_bar()
+#obuilder.configure_columns(cols,filter=True)                                                  
+#    obuilder.configure_columns(['order_id', 'exchange_code'  ], hide=True)
+    ogo = obuilder.build()
+    return ogo
+
+
+cols = ['stock_code','expiry_date', 'right', 'strike_price', 'action', 'order_type', 'quantity', 'stoploss',  'price', 
+        'order_id', 'exchange_code'  ]
+fcols = ['stock_code', 'expiry_date', 'right', 'strike_price']
+
+insc2 = st.container()
+            
+st.header(":blue[Pending Orders]")
+sc1, sc2, sc3, sc4, sc5, sc6, sc7  = st.columns([2,2,10,2,2,2,2], gap="small")
+with sc1:
+    from_date = st.date_input("From Date",format="DD-MM-YYYY").strftime("%Y-%m-%dT00:00:00.000Z")
+with sc2:
+    to_date = st.date_input("To Date",format="DD-MM-YYYY").strftime("%Y-%m-%dT00:00:00.000Z")
+with sc3:
+    roption = st.radio("Show", options=["All Existing Positions", "Selected Positions", "All Orders"],horizontal=True, index=2)
+
+with sc4:
+    osstoploss= st.number_input("StopLoss",max_value=9999999.99)
+                              
+with sc5:
+    osprice= st.number_input("Price",max_value=9999999.99)
+
+with sc6:
+    osqty= st.number_input("Qty",max_value=9999999)
+
+with sc7:
+    oslincdec= st.number_input("Stoploss Inc / Dec",max_value=999999999.99)
+try:
+    st.session_state.placedorders = pd.DataFrame(breeze.get_order_list(exchange_code="NFO", from_date = from_date, to_date=to_date)["Success"])    
+except:
+    st.error(f"{st.session_state.placedorders} -- check out")
+print(f"Placed Orders : {st.session_state.placedorders.columns}")
+if st.session_state.placedorders.shape[0] > 0:
+#            st.write(st.session_state.placedorders)
+    st.session_state.placedorders = st.session_state.placedorders[      
+        ( st.session_state.placedorders["status"]!= "Cancelled") &  
+        (st.session_state.placedorders["status"] != "Expired" ) &   
+        (st.session_state.placedorders["status"] !=  "Executed") &  
+        (st.session_state.placedorders["status"] !=  "Rejected")
+        ]
+    st.session_state.placedorders = st.session_state.placedorders[cols]
+    st.session_state.placedorders["strike_price"]=st.session_state.placedorders["strike_price"].astype("float")
+    if roption == "All Orders":
+        orderstoprocess = st.session_state.placedorders
+    
+    toprocess = AgGrid(st.session_state.placedorders, fit_columns_on_grid_load=False, columns_auto_size_mode=1,gridOptions=buildgridorderoptions(st.session_state.placedorders), data_return_mode="filtered" )
+#            wsforfilter=AgGrid(st.session_state.existingpositions, fit_columns_on_grid_load=False, columns_auto_size_mode=1, gridOptions=buildgridoptions(st.session_state.existingpositions), data_return_mode="filtered" )
+    toprocess=pd.DataFrame(toprocess.selected_rows)
+    st.write(f"{toprocess.shape[0]} rows selected for processing")
+    
+    nact1, nact2, nact3, nact4, nact5, nact6, nact7 = st.columns([5,5,5,5,5,5,5])
+    with nact1:
+        if ( st.button("Modify Order", type="primary", help="All selected orders will be MODIFIED as per the data modified")):
+            for index, data in toprocess.iterrows():
+                data["order_type"] = "Market" if data["price"]=="0" else "Limit"
+                breeze.modify_order(order_id=data["order_id"], 
+                                exchange_code=data["exchange_code"], 
+                                order_type=data["order_type"], 
+                                stoploss=data["stoploss"], 
+                                quantity=data["quantity"],
+                                price=data["price"])
+                sleep(sleeptime)
+            st.rerun()
+    with nact2:
+        if ( st.button("Cancel Order", type="primary", help="All selected orders will be CANCELLED")):
+            for index, data in toprocess.iterrows():
+                breeze.cancel_order(exchange_code=data["exchange_code"], order_id=data["order_id"])
+                sleep(sleeptime)
+            st.rerun()
+
+    with nact3:
+        if ( st.button("To Market Order", type="primary", help="All selected orders will be MODIFIED as MARKET ORDER")):
+            for index, data in toprocess.iterrows():
+                breeze.modify_order(order_id=data["order_id"], 
+                                exchange_code=data["exchange_code"], 
+                                order_type="Market", 
+                                stoploss=0, 
+                                quantity=data["quantity"],
+                                price=0)
+                sleep(sleeptime)
+            st.rerun()
+    with nact4:
+        if ( st.button("To SP Order", type="primary", help="All selected orders will be MODIFIED BASED ON THE DATA PROVIDED ABOVE THE TABLE - STOPLOSS AND PRICE ONLY")):
+            for index, data in toprocess.iterrows():
+                breeze.modify_order(order_id=data["order_id"], 
+                                exchange_code=data["exchange_code"], 
+                                order_type=data["order_type"],
+                                stoploss=osstoploss, 
+                                quantity=data["quantity"],
+                                price=osprice)
+                sleep(sleeptime)
+            st.rerun()
+
+    with nact5:
+        if ( st.button("To Q Order", type="primary", help="All selected orders will be MODIFIED BASED ON THE DATA PROVIDED ABOVE THE TABLE - QUANTITY ONLY")):
+            for index, data in toprocess.iterrows():
+                breeze.modify_order(order_id=data["order_id"], 
+                                exchange_code=data["exchange_code"], 
+                                order_type="Limit" if data["stoploss"] != 0 else "stoploss",                                         
+                                stoploss=data["stoploss"], 
+                                price=data["price"],
+                                quantity=osqty)
+                sleep(sleeptime)
+            st.rerun()
+
+    with nact6:
+        if ( st.button("To SPQ Order", type="primary", help="All selected orders will be MODIFIED BASED ON THE DATA PROVIDED ABOVE THE TABLE  - STOPLOSS PRICE AND QUANTITY")):
+            for index, data in toprocess.iterrows():
+                breeze.modify_order(order_id=data["order_id"], 
+                                exchange_code=data["exchange_code"], 
+                                order_type=data["order_type"], 
+                                stoploss=osstoploss, 
+                                quantity=osqty,
+                                price=osprice)
+                sleep(sleeptime)
+            st.rerun()
+
+    with nact7:
+        if ( st.button("Modify Order SL/Limit", type="primary", help="All selected STOPLOSS / LIMIT orders will be MODIFIED for PRICE and/or STOPLOSS as per the SL Inc/Dec provided")):
+            for index, data in toprocess.iterrows():
+                if data["order_type"].lower() =="stoploss" or data["order_type"].lower() =="limit":
+                    print(f"-------------- {float(data['stoploss'])+oslincdec} - {float(data['price'])+oslincdec}")
+                    breeze.modify_order(order_id=data["order_id"], 
+                                    exchange_code=data["exchange_code"], 
+                                    order_type=data["order_type"], 
+                                    stoploss=0 if data["order_type"].lower() =="limit" else float(data["stoploss"])+oslincdec, 
+                                    quantity=data["quantity"],
+                                    price=float(data["price"])+oslincdec)
+                    sleep(sleeptime)
+            st.rerun()
+
+            
+st.header(":blue[Existing Positions]",)
+try:
+    st.session_state.existingpositions = pd.DataFrame(breeze.get_portfolio_positions()["Success"]) 
+#            st.write(st.session_state.existingpositions)
+    print(st.session_state.existingpositions)
+except:
+    st.error(f"{st.session_state.existingpositions } - check out ")
+if not st.session_state.existingpositions.empty: 
+    st.session_state.existingpositions["strike_price"]=st.session_state.existingpositions["strike_price"].astype("float")
+    st.session_state.existingpositions = st.session_state.existingpositions[["exchange_code","action","stock_code","expiry_date","right","strike_price","average_price", 'ltp', "quantity"]]
+#        st.write(st.session_state.existingpositions.columns)
+#        st.write(st.session_state.placedorders.columns)
+    if st.session_state.placedorders.shape[0] > 0:
+        st.session_state.existingpositions= pd.merge(st.session_state.existingpositions, st.session_state.placedorders, how="outer", on=fcols)
+        print(f"Existing Positions : {st.session_state.existingpositions}") 
+    st.session_state.existingpositions["sq_qty"]=0 
+    st.session_state.existingpositions["sq_stoploss"]=0.00 
+    st.session_state.existingpositions["sq_price"]=0.00 
+    selectedrowsforfilter=AgGrid(st.session_state.existingpositions, fit_columns_on_grid_load=False, columns_auto_size_mode=1, gridOptions=buildgridoptions(st.session_state.existingpositions), data_return_mode="filtered" )
+    selectedrowsforfilter=pd.DataFrame(selectedrowsforfilter.selected_rows)
+    if not selectedrowsforfilter.empty:
+        selectedrowsforfilter=selectedrowsforfilter[fcols]
+#            st.write(f"{selectedrowsforfilter.shape[0]} rows selected for processing")
+        st.write(f"{selectedrowsforfilter.shape[0]} rows selected for processing")
+        if ( st.button("Market Square off", type="primary")):
+            for index, data in selectedrowsforfilter.iterrows():
+                otype = "CE" if data["right"].lower()=="call" else ( "PE" if data["right"].lower()=="put" else "XX")
+                lotqty = pd.DataFrame( list( trdb.fnobasicdata.find( {"ShortName" : data["stock_code"],
+                                                                         "ExpiryDate" : datetime.strptime(data["expiry_date"], "%d-%b-%Y"),
+                                                                         "OptionType" : otype,
+                                                                         "StrikePrice" : data["strike_price"]}, {"_id" : 0} )))["LotSize"][0]            
+                maxqty = pd.DataFrame( list( trdb.symbolmapping.find( {"stock_code" : data["stock_code"]}, {"_id" : 0} )))["maxqty"][0]                
+                st.write(f"{maxqty} @ {lotqty} / Lot")
+                sqty = data["quantity"] if data["sq_qty"] == 0 else data["sq_ty"]
+                if sqty < maxqty:
+                    breeze.place_order(stock_code=data["stock_code"], exchange_code=data["exchange_code"],
+                                       order_type="Market", action = "Sell" if data["action"].lower()=="buy" else "Buy",
+                                       stoploss=0, price=0, expiry_date=data["expiry_date"],
+                                       strike_price=data["strike_price"],right=data["right"],
+                                       quantity=sqty
+                                       )
+    else:
+        st.write(":orange[No selection on positions made yet]")
+    
+else:
+    st.write(" ")
+    st.write(" ")
+    st.markdown(":orange[**No pending orders**]")
